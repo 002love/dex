@@ -170,6 +170,36 @@ fn process_initialize(
         msg!("Requested leverage ({}x) exceeds maximum allowed ({}x). Capping at {}x.", 
             initialize_data.leverage, MAXIMUM_LEVERAGE, MAXIMUM_LEVERAGE);
     }
+
+    let base_fee = initialize_data.paid_amount.checked_mul(BASE_FEE_BASIS_POINTS)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_div(10000)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+        
+    let leverage_fee = initialize_data.paid_amount.checked_mul(LEVERAGE_FEE_BASIS_POINTS)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_mul(leverage as u64)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_div(10000)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    
+    let total_fee = base_fee.checked_add(leverage_fee)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let position_amount_after_fees = initialize_data.paid_amount.checked_sub(total_fee)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    let actual_position_size = position_amount_after_fees.checked_mul(leverage as u64)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+
+    if actual_position_size < MIN_POSITION_SIZE_LAMPORTS {
+        msg!(
+            "Position size after fees and leverage ({} lamports) is below minimum required: {} lamports (0.01 SOL)", 
+            actual_position_size, 
+            MIN_POSITION_SIZE_LAMPORTS
+        );
+        return Err(ProgramError::InvalidArgument);
+    }
     
     if initialize_data.direction != POSITION_LONG && initialize_data.direction != POSITION_SHORT {
         msg!("Invalid position direction. Must be 1 (long) or -1 (short)");
@@ -198,6 +228,7 @@ fn process_initialize(
         msg!("Position account address does not match the PDA");
         return Err(ProgramError::InvalidArgument);
     }
+
     
     let position = PositionAccount {
         owner: *owner_account.key,
@@ -205,8 +236,8 @@ fn process_initialize(
         market_symbol: initialize_data.market_symbol.clone(),
         entry_price: 0,
         liquidation_price: 0,
-        paid_amount: initialize_data.paid_amount,
-        position_size: initialize_data.position_size,
+        paid_amount: position_amount_after_fees,
+        position_size: actual_position_size,
         leverage: leverage,
         closed: 0,
         position_nonce: initialize_data.position_nonce,
@@ -219,21 +250,6 @@ fn process_initialize(
     let rent = Rent::get()?;
     let account_rent = rent.minimum_balance(data_len);
     
-    let base_fee = initialize_data.paid_amount.checked_mul(BASE_FEE_BASIS_POINTS)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_div(10000)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-        
-    let leverage_fee = initialize_data.paid_amount.checked_mul(LEVERAGE_FEE_BASIS_POINTS)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_mul(leverage as u64)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_div(10000)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    
-    let fee_amount = base_fee.checked_add(leverage_fee)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-    
     let seeds = &[
         b"uranus_position",
         owner_account.key.as_ref(),
@@ -245,7 +261,7 @@ fn process_initialize(
         &system_instruction::transfer(
             payer_account.key,
             dex_account.key,
-            fee_amount,
+            total_fee,
         ),
         &[
             payer_account.clone(),
@@ -254,14 +270,11 @@ fn process_initialize(
         ],
     )?;
 
-    let position_amount = initialize_data.paid_amount.checked_sub(fee_amount)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
     invoke_signed(
         &system_instruction::create_account(
             payer_account.key,
             position_account.key,
-            position_amount,
+            position_amount_after_fees,
             data_len as u64,
             program_id,
         ),
@@ -275,16 +288,12 @@ fn process_initialize(
 
     position.serialize(&mut *position_account.data.borrow_mut())?;
 
-    let fee_percentage = (BASE_FEE_BASIS_POINTS as f64 / 10000.0) + 
-                         (LEVERAGE_FEE_BASIS_POINTS as f64 / 10000.0 * leverage as f64);
-    let fee_percentage_str = format!("{:.3}%", fee_percentage * 100.0);
-
     msg!("Uranus position initialized successfully with position nonce: {}", initialize_data.position_nonce);
-    msg!("Fee collected: {} lamports sent to DEX wallet ({})", fee_amount, fee_percentage_str);
-    msg!("Base fee: 0.5% (50 basis points) + 0.05% per leverage unit");
-    msg!("Position amount locked: {} lamports", position_amount);
-    msg!("Position leverage set to: {}x (maximum allowed is {}x)", leverage, MAXIMUM_LEVERAGE);
+    msg!("Fee collected: {} lamports sent to DEX", total_fee);
+    msg!("Position amount locked: {} lamports", position_amount_after_fees);
+    msg!("Position leverage set to: {}x (current maximum allowed is {}x)", leverage, MAXIMUM_LEVERAGE);
     msg!("Position direction: {}", if initialize_data.direction == POSITION_LONG { "LONG" } else { "SHORT" });
+    msg!("Position opened on market ticker: {}", initialize_data.market_symbol);
     Ok(())
 }
 
@@ -382,7 +391,7 @@ fn process_user_modify(
     
     if user_data.close_position {
         position.closed = 1;
-        msg!("Position nonce: {} closed successfully", position.position_nonce);
+        msg!("Position nonce: {} marked to close successfully", position.position_nonce);
     }
     
     position.serialize(&mut *position_account.data.borrow_mut())?;
