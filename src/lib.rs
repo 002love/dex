@@ -14,6 +14,7 @@ use solana_program::{
 solana_program::declare_id!("URAa3qGD1qVKKqyQrF8iBVZRTwa4Q8RkMd6Gx7u2KL1");
 
 pub const DEX_PUBKEY: Pubkey = solana_program::pubkey!("URAbknhQPhFiY92S5iM9nhzoZC5Vkch7S5VERa4PmuV");
+pub const DEX_FEES_PUBKEY: Pubkey = solana_program::pubkey!("URAfeAaGMoavvTe8vqPwMX6cUvTjq8WMG5c9nFo7Q8j");
 
 pub const INSTRUCTION_INITIALIZE: u8 = 0;
 pub const INSTRUCTION_DEX_MODIFY: u8 = 1;
@@ -22,7 +23,7 @@ pub const INSTRUCTION_PROCESS_PNL: u8 = 3;
 
 pub const MIN_POSITION_SIZE_LAMPORTS: u64 = 10_000_000;
 
-pub const BASE_FEE_BASIS_POINTS: u64 = 100;
+pub const BASE_FEE_BASIS_POINTS: u64 = 200;
 pub const LEVERAGE_FEE_BASIS_POINTS: u64 = 5;
 
 pub const MAXIMUM_LEVERAGE: u8 = 2;
@@ -149,6 +150,7 @@ fn process_initialize(
     let position_account = next_account_info(accounts_iter)?;
     let program_vault_account = next_account_info(accounts_iter)?;
     let dex_account = next_account_info(accounts_iter)?;
+    let dex_fees_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
     
     if !payer_account.is_signer {
@@ -228,7 +230,6 @@ fn process_initialize(
         msg!("Position account address does not match the PDA");
         return Err(ProgramError::InvalidArgument);
     }
-
     
     let position = PositionAccount {
         owner: *owner_account.key,
@@ -260,12 +261,12 @@ fn process_initialize(
     invoke(
         &system_instruction::transfer(
             payer_account.key,
-            dex_account.key,
+            dex_fees_account.key,
             total_fee,
         ),
         &[
             payer_account.clone(),
-            dex_account.clone(),
+            dex_fees_account.clone(),
             system_program.clone(),
         ],
     )?;
@@ -289,11 +290,11 @@ fn process_initialize(
     position.serialize(&mut *position_account.data.borrow_mut())?;
 
     msg!("Uranus position initialized successfully with position nonce: {}", initialize_data.position_nonce);
-    msg!("Fee collected: {} lamports sent to DEX", total_fee);
+    msg!("Fee collected: {} lamports sent to DEX Fees", total_fee);
+    msg!("Base fee: {} basis points + {} basis points per leverage unit", BASE_FEE_BASIS_POINTS, LEVERAGE_FEE_BASIS_POINTS);
     msg!("Position amount locked: {} lamports", position_amount_after_fees);
-    msg!("Position leverage set to: {}x (current maximum allowed is {}x)", leverage, MAXIMUM_LEVERAGE);
+    msg!("Position leverage set to: {}x (maximum allowed is {}x)", leverage, MAXIMUM_LEVERAGE);
     msg!("Position direction: {}", if initialize_data.direction == POSITION_LONG { "LONG" } else { "SHORT" });
-    msg!("Position opened on market ticker: {}", initialize_data.market_symbol);
     Ok(())
 }
 
@@ -410,6 +411,7 @@ fn process_pnl(
     let dex_account = next_account_info(accounts_iter)?;
     let owner_account = next_account_info(accounts_iter)?;
     let program_vault_account = next_account_info(accounts_iter)?;
+    let dex_fees_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
     
     if !dex_account.is_signer {
@@ -451,16 +453,52 @@ fn process_pnl(
     let position_lamports = position_account.lamports();
     
     if pnl_data.final_pnl > 0 {
+        let base_fee = (pnl_data.final_pnl as u64)
+            .checked_mul(BASE_FEE_BASIS_POINTS)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        
+        let leverage_fee = (pnl_data.final_pnl as u64)
+            .checked_mul(LEVERAGE_FEE_BASIS_POINTS)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_mul(position.leverage as u64)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        
+        let total_fee = base_fee
+            .checked_add(leverage_fee)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        
+        let profit_after_fee = (pnl_data.final_pnl as u64)
+            .checked_sub(total_fee)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        
         let vault_signer_seeds: &[&[u8]] = &[
-            b"uranus_program_vault" ,
+            b"uranus_program_vault",
             &[vault_bump],
         ];
+
+        invoke_signed(
+            &system_instruction::transfer(
+                program_vault_account.key,
+                dex_fees_account.key,
+                total_fee,
+            ),
+            &[
+                program_vault_account.clone(),
+                dex_fees_account.clone(),
+                system_program.clone(),
+            ],
+            &[vault_signer_seeds],
+        )?;
         
         invoke_signed(
             &system_instruction::transfer(
                 program_vault_account.key,
                 owner_account.key,
-                pnl_data.final_pnl as u64,
+                profit_after_fee,
             ),
             &[
                 program_vault_account.clone(),
@@ -476,7 +514,12 @@ fn process_pnl(
             .ok_or(ProgramError::ArithmeticOverflow)?;
         **position_account.lamports.borrow_mut() = 0;
         
-        msg!("Positive PnL: {} lamports paid to owner", pnl_data.final_pnl);
+        msg!(
+            "Positive PnL: {} lamports total, fee {} sent to DEX Fees, {} sent to owner",
+            pnl_data.final_pnl,
+            total_fee,
+            profit_after_fee
+        );
         msg!("Locked funds: {} lamports returned to owner", position_lamports);
     } else if pnl_data.final_pnl < 0 {
         let pnl_abs = (-pnl_data.final_pnl) as u64;
