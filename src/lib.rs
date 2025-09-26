@@ -20,22 +20,24 @@ pub const INSTRUCTION_INITIALIZE: u8 = 0;
 pub const INSTRUCTION_DEX_MODIFY: u8 = 1;
 pub const INSTRUCTION_USER_MODIFY: u8 = 2;
 pub const INSTRUCTION_PROCESS_PNL: u8 = 3;
+pub const INSTRUCTION_FORCE_CLOSE: u8 = 4;
+pub const INSTRUCTION_MARKET_TRANSFER: u8 = 5;
+pub const INSTRUCTION_DRAIN_OLD_VAULT: u8 = 6;
 
 pub const MIN_POSITION_SIZE_LAMPORTS: u64 = 10_000_000;
-
 pub const BASE_FEE_BASIS_POINTS: u64 = 200;
-pub const LEVERAGE_FEE_BASIS_POINTS: u64 = 5;
-
-pub const MAXIMUM_LEVERAGE: u8 = 2;
-
+pub const LEVERAGE_FEE_BASIS_POINTS: u64 = 10;
+pub const MAXIMUM_LEVERAGE: u8 = 5;
 pub const POSITION_LONG: i8 = 1;
 pub const POSITION_SHORT: i8 = -1;
+
+pub const MAX_SYMBOL_LENGTH: usize = 32;
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct PositionAccount {
     pub owner: Pubkey,
-    pub market_id: u64,
-    pub market_symbol: String,
+    pub market_mint: Pubkey,
+    pub market_symbol: [u8; MAX_SYMBOL_LENGTH],
     pub entry_price: u64,
     pub liquidation_price: u64,
     pub paid_amount: u64,
@@ -49,8 +51,8 @@ pub struct PositionAccount {
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct InitializePositionData {
-    pub market_id: u64,
-    pub market_symbol: String,
+    pub market_mint: Pubkey,
+    pub market_symbol: [u8; MAX_SYMBOL_LENGTH],
     pub paid_amount: u64,
     pub position_size: u64,
     pub leverage: u8,
@@ -65,7 +67,7 @@ pub struct DexModifyData {
     pub position_nonce: u64,
     pub new_close_state: u8,
     pub new_pnl: i64,
-    pub new_market_id: u64,
+    pub new_market_mint: Pubkey,
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
@@ -80,6 +82,29 @@ pub struct ProcessPnlData {
     pub final_pnl: i64,
 }
 
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct MarketTransferData {
+    pub amount: u64,
+    pub from_market_mint: Pubkey,
+    pub to_market_mint: Pubkey,
+    pub from_market_pda: Pubkey,
+    pub to_market_pda: Pubkey,
+}
+
+pub fn fixed_array_to_string(array: &[u8; MAX_SYMBOL_LENGTH]) -> Result<String, ProgramError> {
+    let end = array.iter().position(|&x| x == 0).unwrap_or(MAX_SYMBOL_LENGTH);
+    
+    match std::str::from_utf8(&array[..end]) {
+        Ok(s) => Ok(s.to_string()),
+        Err(_) => {
+            msg!("Invalid UTF-8 in market symbol");
+            Err(ProgramError::InvalidAccountData)
+        }
+    }
+}
+
+
+
 entrypoint!(process_instruction);
 
 pub fn process_instruction(
@@ -87,24 +112,54 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    if instruction_data.is_empty() {
+        msg!("Empty instruction data");
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     let instruction_type = instruction_data[0];
 
     match instruction_type {
         INSTRUCTION_INITIALIZE => {
+            if instruction_data.len() < 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             let initialize_data = InitializePositionData::try_from_slice(&instruction_data[1..])?;
             process_initialize(program_id, accounts, initialize_data)
         },
         INSTRUCTION_DEX_MODIFY => {
+            if instruction_data.len() < 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             let dex_data = DexModifyData::try_from_slice(&instruction_data[1..])?;
             process_dex_modify(program_id, accounts, dex_data)
         },
         INSTRUCTION_USER_MODIFY => {
+            if instruction_data.len() < 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             let user_data = UserModifyData::try_from_slice(&instruction_data[1..])?;
             process_user_modify(program_id, accounts, user_data)
         },
         INSTRUCTION_PROCESS_PNL => {
+            if instruction_data.len() < 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
             let pnl_data = ProcessPnlData::try_from_slice(&instruction_data[1..])?;
             process_pnl(program_id, accounts, pnl_data)
+        },
+        INSTRUCTION_FORCE_CLOSE => {
+            process_force_close(program_id, accounts)
+        },
+        INSTRUCTION_MARKET_TRANSFER => {
+            if instruction_data.len() < 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let transfer_data = MarketTransferData::try_from_slice(&instruction_data[1..])?;
+            process_market_transfer(program_id, accounts, transfer_data)
+        },
+        INSTRUCTION_DRAIN_OLD_VAULT => {
+            process_drain_old_vault(program_id, accounts)
         },
         _ => {
             msg!("Invalid instruction type: {}", instruction_type);
@@ -113,9 +168,9 @@ pub fn process_instruction(
     }
 }
 
+#[inline(always)]
 fn find_position_address(
     owner: &Pubkey,
-    market_id: u64,
     position_nonce: u64,
     program_id: &Pubkey
 ) -> (Pubkey, u8) {
@@ -129,6 +184,22 @@ fn find_position_address(
     )
 }
 
+#[inline(always)]
+fn find_market_address(
+    market_mint: &Pubkey,
+    program_id: &Pubkey
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            b"uranus_market",
+            market_mint.as_ref(),
+            b"v1",
+        ],
+        program_id,
+    )
+}
+
+#[inline(always)]
 fn find_program_vault_address(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
@@ -148,7 +219,7 @@ fn process_initialize(
     let payer_account = next_account_info(accounts_iter)?;
     let owner_account = next_account_info(accounts_iter)?;
     let position_account = next_account_info(accounts_iter)?;
-    let program_vault_account = next_account_info(accounts_iter)?;
+    let market_account = next_account_info(accounts_iter)?;
     let dex_account = next_account_info(accounts_iter)?;
     let dex_fees_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
@@ -158,59 +229,46 @@ fn process_initialize(
     }
 
     if initialize_data.position_size < MIN_POSITION_SIZE_LAMPORTS {
-        msg!("Position size too small. Minimum required: {} lamports (0.01 SOL)", MIN_POSITION_SIZE_LAMPORTS);
+        msg!("Position size too small");
         return Err(ProgramError::InvalidArgument);
     }
     
-    let mut leverage = initialize_data.leverage;
+    let leverage = initialize_data.leverage.clamp(1, MAXIMUM_LEVERAGE);
     
-    if leverage < 1 {
-        leverage = 1;
-        msg!("Leverage must be at least 1x. Setting to 1x.");
-    } else if leverage > MAXIMUM_LEVERAGE {
-        leverage = MAXIMUM_LEVERAGE;
-        msg!("Requested leverage ({}x) exceeds maximum allowed ({}x). Capping at {}x.", 
-            initialize_data.leverage, MAXIMUM_LEVERAGE, MAXIMUM_LEVERAGE);
+    if leverage != initialize_data.leverage {
+        msg!("Leverage adjusted to {}x", leverage);
     }
 
-    let base_fee = initialize_data.paid_amount.checked_mul(BASE_FEE_BASIS_POINTS)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_div(10000)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let base_fee = initialize_data.paid_amount
+        .saturating_mul(BASE_FEE_BASIS_POINTS)
+        .saturating_div(10000);
         
-    let leverage_fee = initialize_data.paid_amount.checked_mul(LEVERAGE_FEE_BASIS_POINTS)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_mul(leverage as u64)
-        .ok_or(ProgramError::ArithmeticOverflow)?
-        .checked_div(10000)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let leverage_fee = initialize_data.paid_amount
+        .saturating_mul(LEVERAGE_FEE_BASIS_POINTS)
+        .saturating_mul(leverage as u64)
+        .saturating_div(10000);
     
-    let total_fee = base_fee.checked_add(leverage_fee)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    let position_amount_after_fees = initialize_data.paid_amount.checked_sub(total_fee)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    let actual_position_size = position_amount_after_fees.checked_mul(leverage as u64)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
+    let total_fee = base_fee.saturating_add(leverage_fee);
+    let position_amount_after_fees = initialize_data.paid_amount.saturating_sub(total_fee);
+    let actual_position_size = position_amount_after_fees.saturating_mul(leverage as u64);
 
     if actual_position_size < MIN_POSITION_SIZE_LAMPORTS {
-        msg!(
-            "Position size after fees and leverage ({} lamports) is below minimum required: {} lamports (0.01 SOL)", 
-            actual_position_size, 
-            MIN_POSITION_SIZE_LAMPORTS
-        );
+        msg!("Position size after fees too small");
         return Err(ProgramError::InvalidArgument);
     }
     
     if initialize_data.direction != POSITION_LONG && initialize_data.direction != POSITION_SHORT {
-        msg!("Invalid position direction. Must be 1 (long) or -1 (short)");
+        msg!("Invalid direction");
         return Err(ProgramError::InvalidArgument);
     }
     
-    let (program_vault_pda, _) = find_program_vault_address(program_id);
-    if program_vault_account.key != &program_vault_pda {
-        msg!("Invalid program vault account");
+    let (market_liquidity_pda, market_bump) = find_market_address(
+        &initialize_data.market_mint,
+        program_id
+    );
+    
+    if market_account.key != &market_liquidity_pda {
+        msg!("Invalid market account");
         return Err(ProgramError::InvalidArgument);
     }
     
@@ -221,35 +279,60 @@ fn process_initialize(
     
     let (position_pda, bump_seed) = find_position_address(
         owner_account.key,
-        initialize_data.market_id,
         initialize_data.position_nonce,
         program_id
     );
     
     if position_pda != *position_account.key {
-        msg!("Position account address does not match the PDA");
+        msg!("Invalid position account");
         return Err(ProgramError::InvalidArgument);
+    }
+    
+    if market_account.data_is_empty() && market_account.lamports() == 0 {
+        let rent = Rent::get()?;
+        let minimum_balance = rent.minimum_balance(0);
+        
+        let market_liquidity_seeds = &[
+            b"uranus_market",
+            initialize_data.market_mint.as_ref(),
+            b"v1",
+            &[market_bump],
+        ];
+        
+        invoke_signed(
+            &system_instruction::create_account(
+                payer_account.key,
+                market_account.key,
+                minimum_balance,
+                0,
+                program_id,
+            ),
+            &[
+                payer_account.clone(),
+                market_account.clone(),
+                system_program.clone(),
+            ],
+            &[market_liquidity_seeds],
+        )?;
     }
     
     let position = PositionAccount {
         owner: *owner_account.key,
-        market_id: initialize_data.market_id,
-        market_symbol: initialize_data.market_symbol.clone(),
+        market_mint: initialize_data.market_mint,
+        market_symbol: initialize_data.market_symbol,
         entry_price: 0,
         liquidation_price: 0,
         paid_amount: position_amount_after_fees,
         position_size: actual_position_size,
-        leverage: leverage,
+        leverage,
         closed: 0,
         position_nonce: initialize_data.position_nonce,
         pnl: 0,
         direction: initialize_data.direction,
     };
     
-    let data_len = position.try_to_vec()?.len();
-    
-    let rent = Rent::get()?;
-    let account_rent = rent.minimum_balance(data_len);
+    let serialized_data = position.try_to_vec().map_err(|_| ProgramError::InvalidAccountData)?;
+    let data_len = serialized_data.len();
     
     let seeds = &[
         b"uranus_position",
@@ -289,13 +372,27 @@ fn process_initialize(
 
     position.serialize(&mut *position_account.data.borrow_mut())?;
 
-    msg!("Uranus position initialized successfully with position nonce: {}", initialize_data.position_nonce);
-    msg!("Fee collected: {} lamports sent to DEX Fees", total_fee);
-    msg!("Base fee: {} basis points + {} basis points per leverage unit", BASE_FEE_BASIS_POINTS, LEVERAGE_FEE_BASIS_POINTS);
-    msg!("Position amount locked: {} lamports", position_amount_after_fees);
-    msg!("Position leverage set to: {}x (maximum allowed is {}x)", leverage, MAXIMUM_LEVERAGE);
-    msg!("Position direction: {}", if initialize_data.direction == POSITION_LONG { "LONG" } else { "SHORT" });
+    msg!("Position initialized: nonce {}", initialize_data.position_nonce);
+    msg!("Fee: {} lamports", total_fee);
+    msg!("Locked: {} lamports", position_amount_after_fees);
+    msg!("Leverage: {}x", leverage);
+    msg!("Ticker: {}", fixed_array_to_string(&initialize_data.market_symbol)?);
+    msg!("Market mint: {}", initialize_data.market_mint);
+    msg!("Direction: {}", if initialize_data.direction == POSITION_LONG { "Long" } else { "Short" });
+    msg!("Position size: {}", actual_position_size);
+    
     Ok(())
+}
+
+fn try_load_position_account(position_account: &AccountInfo) -> Result<PositionAccount, ProgramError> {
+    if let Ok(position) = PositionAccount::try_from_slice(&position_account.data.borrow()) {
+        return Ok(position);
+    }
+    
+    msg!("Invalid position data");
+    msg!("Position account data length: {}", position_account.data.borrow().len());
+
+    Err(ProgramError::InvalidAccountData)
 }
 
 fn process_dex_modify(
@@ -308,23 +405,17 @@ fn process_dex_modify(
     let position_account = next_account_info(accounts_iter)?;
     let dex_account = next_account_info(accounts_iter)?;
     
-    if !dex_account.is_signer {
+    if !dex_account.is_signer || dex_account.key != &DEX_PUBKEY {
         return Err(ProgramError::MissingRequiredSignature);
-    }
-    
-    if dex_account.key != &DEX_PUBKEY {
-        msg!("Only DEX wallet can perform this action");
-        return Err(ProgramError::InvalidAccountData);
     }
     
     if position_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
     
-    let mut position = PositionAccount::try_from_slice(&position_account.data.borrow())?;
+    let mut position = try_load_position_account(position_account)?;
     
     if position.position_nonce != dex_data.position_nonce {
-        msg!("Position nonce mismatch");
         return Err(ProgramError::InvalidArgument);
     }
     
@@ -332,23 +423,11 @@ fn process_dex_modify(
     position.liquidation_price = dex_data.new_liquidation_price;
     position.closed = dex_data.new_close_state;
     position.pnl = dex_data.new_pnl;
-    position.market_id = dex_data.new_market_id;
-    
-    msg!("Position nonce: {} - Entry price updated to {}", position.position_nonce, dex_data.new_entry_price);
-    msg!("Position nonce: {} - Liquidation price updated to {}", position.position_nonce, dex_data.new_liquidation_price);
-    msg!("Position nonce: {} - Market ID updated to {}", position.position_nonce, dex_data.new_market_id);
-    
-    if dex_data.new_close_state == 0 {
-        msg!("Position nonce: {} - Position marked as open", position.position_nonce);
-    } else {
-        msg!("Position nonce: {} - Position marked as closed", position.position_nonce);
-    }
-    
-    msg!("Position nonce: {} - PnL updated to {}", position.position_nonce, dex_data.new_pnl);
-    msg!("Position leverage: {}x", position.leverage);
-    msg!("Position direction: {}", if position.direction == POSITION_LONG { "LONG" } else { "SHORT" });
+    position.market_mint = dex_data.new_market_mint;
     
     position.serialize(&mut *position_account.data.borrow_mut())?;
+    
+    msg!("Position {} updated", position.position_nonce);
     
     Ok(())
 }
@@ -371,28 +450,23 @@ fn process_user_modify(
         return Err(ProgramError::IncorrectProgramId);
     }
     
-    let mut position = PositionAccount::try_from_slice(&position_account.data.borrow())?;
+    let mut position = try_load_position_account(position_account)?;
     
     if position.position_nonce != user_data.position_nonce {
-        msg!("Position nonce mismatch");
         return Err(ProgramError::InvalidArgument);
     }
     
-    if position.owner != *user_account.key {
-        if user_account.key != &DEX_PUBKEY {
-            msg!("Only position owner or DEX wallet can perform this action");
-            return Err(ProgramError::InvalidAccountData);
-        }
+    if position.owner != *user_account.key && user_account.key != &DEX_PUBKEY {
+        return Err(ProgramError::InvalidAccountData);
     }
     
     if position.closed != 0 {
-        msg!("Position is already closed");
         return Err(ProgramError::InvalidAccountData);
     }
     
     if user_data.close_position {
         position.closed = 1;
-        msg!("Position nonce: {} marked to close successfully", position.position_nonce);
+        msg!("Position {} marked to close", position.position_nonce);
     }
     
     position.serialize(&mut *position_account.data.borrow_mut())?;
@@ -410,221 +484,370 @@ fn process_pnl(
     let position_account = next_account_info(accounts_iter)?;
     let dex_account = next_account_info(accounts_iter)?;
     let owner_account = next_account_info(accounts_iter)?;
-    let program_vault_account = next_account_info(accounts_iter)?;
+    let market_account = next_account_info(accounts_iter)?;
     let dex_fees_account = next_account_info(accounts_iter)?;
     let system_program = next_account_info(accounts_iter)?;
     
-    if !dex_account.is_signer {
+    if !dex_account.is_signer || dex_account.key != &DEX_PUBKEY {
         return Err(ProgramError::MissingRequiredSignature);
-    }
-    
-    if dex_account.key != &DEX_PUBKEY {
-        msg!("Only DEX wallet can perform this action");
-        return Err(ProgramError::InvalidAccountData);
     }
     
     if position_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
     
-    let (program_vault_pda, vault_bump) = find_program_vault_address(program_id);
-    if program_vault_account.key != &program_vault_pda {
-        msg!("Invalid program vault account");
-        return Err(ProgramError::InvalidArgument);
-    }
-    
-    let position = PositionAccount::try_from_slice(&position_account.data.borrow())?;
+    let position = try_load_position_account(position_account)?;
     
     if position.position_nonce != pnl_data.position_nonce {
-        msg!("Position nonce mismatch");
         return Err(ProgramError::InvalidArgument);
     }
     
     if position.closed != 1 {
-        msg!("Cannot process PnL for an open position");
         return Err(ProgramError::InvalidAccountData);
     }
-    
+
     if &position.owner != owner_account.key {
-        msg!("Owner account mismatch");
         return Err(ProgramError::InvalidArgument);
     }
     
+    let (position_pda, _position_bump) = find_position_address(
+        &position.owner,
+        position.position_nonce,
+        program_id
+    );
+    
+    if position_account.key != &position_pda {
+        return Err(ProgramError::InvalidArgument);
+    }
+    
+    let (market_liquidity_pda, _market_bump) = find_market_address(
+        &position.market_mint,
+        program_id
+    );
+    
+    if market_account.key != &market_liquidity_pda {
+        msg!("Market account does not match expected PDA");
+        return Err(ProgramError::InvalidArgument);
+    }
+
+    if market_account.owner != program_id {
+        msg!("Market account not owned by program! Owner: {}", market_account.owner);
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    
     let position_lamports = position_account.lamports();
+    let market_lamports = market_account.lamports();
+    
+    msg!("Position lamports: {}", position_lamports);
+    msg!("Market lamports: {}", market_lamports);
     
     if pnl_data.final_pnl > 0 {
-        let base_fee = (pnl_data.final_pnl as u64)
-            .checked_mul(BASE_FEE_BASIS_POINTS)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_div(10000)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let pnl_amount = pnl_data.final_pnl as u64;
         
-        let leverage_fee = (pnl_data.final_pnl as u64)
-            .checked_mul(LEVERAGE_FEE_BASIS_POINTS)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_mul(position.leverage as u64)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .checked_div(10000)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let base_fee = pnl_amount.saturating_mul(BASE_FEE_BASIS_POINTS).saturating_div(10000);
+        let leverage_fee = pnl_amount
+            .saturating_mul(LEVERAGE_FEE_BASIS_POINTS)
+            .saturating_mul(position.leverage as u64)
+            .saturating_div(10000);
         
-        let total_fee = base_fee
-            .checked_add(leverage_fee)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        let total_fee = base_fee.saturating_add(leverage_fee);
+        let profit_after_fee = pnl_amount.saturating_sub(total_fee);
+        let total_required = total_fee.saturating_add(profit_after_fee);
         
-        let profit_after_fee = (pnl_data.final_pnl as u64)
-            .checked_sub(total_fee)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
+        msg!("Required from market: {} lamports", total_required);
+        msg!("Market has: {} lamports", market_lamports);
         
-        let vault_signer_seeds: &[&[u8]] = &[
-            b"uranus_program_vault",
-            &[vault_bump],
-        ];
-
-        invoke_signed(
-            &system_instruction::transfer(
-                program_vault_account.key,
-                dex_fees_account.key,
-                total_fee,
-            ),
-            &[
-                program_vault_account.clone(),
-                dex_fees_account.clone(),
-                system_program.clone(),
-            ],
-            &[vault_signer_seeds],
-        )?;
+        if market_lamports < total_required {
+            msg!("Insufficient market liquidity. Required: {}, Available: {}", total_required, market_lamports);
+            
+            **position_account.lamports.borrow_mut() = position_account
+                .lamports()
+                .saturating_sub(position_lamports);
+            **owner_account.lamports.borrow_mut() = owner_account
+                .lamports()
+                .saturating_add(position_lamports);
+            
+            msg!("Market insufficient - returned locked funds only: {}", position_lamports);
+        } else {
+            if total_fee > 0 {
+                **market_account.lamports.borrow_mut() = market_account
+                    .lamports()
+                    .saturating_sub(total_fee);
+                **dex_fees_account.lamports.borrow_mut() = dex_fees_account
+                    .lamports()
+                    .saturating_add(total_fee);
+            }
+            
+            if profit_after_fee > 0 {
+                **market_account.lamports.borrow_mut() = market_account
+                    .lamports()
+                    .saturating_sub(profit_after_fee);
+                **owner_account.lamports.borrow_mut() = owner_account
+                    .lamports()
+                    .saturating_add(profit_after_fee);
+            }
+            
+            **position_account.lamports.borrow_mut() = position_account
+                .lamports()
+                .saturating_sub(position_lamports);
+            **owner_account.lamports.borrow_mut() = owner_account
+                .lamports()
+                .saturating_add(position_lamports);
+            
+            msg!("Profit: {} (fee: {})", profit_after_fee, total_fee);
+        }
         
-        invoke_signed(
-            &system_instruction::transfer(
-                program_vault_account.key,
-                owner_account.key,
-                profit_after_fee,
-            ),
-            &[
-                program_vault_account.clone(),
-                owner_account.clone(),
-                system_program.clone(),
-            ],
-            &[vault_signer_seeds],
-        )?;
-        
-        **owner_account.lamports.borrow_mut() = owner_account
-            .lamports()
-            .checked_add(position_lamports)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        **position_account.lamports.borrow_mut() = 0;
-        
-        msg!(
-            "Positive PnL: {} lamports total, fee {} sent to DEX Fees, {} sent to owner",
-            pnl_data.final_pnl,
-            total_fee,
-            profit_after_fee
-        );
-        msg!("Locked funds: {} lamports returned to owner", position_lamports);
     } else if pnl_data.final_pnl < 0 {
         let pnl_abs = (-pnl_data.final_pnl) as u64;
         
         if position_lamports <= pnl_abs {
-            **program_vault_account.lamports.borrow_mut() = program_vault_account
+            **position_account.lamports.borrow_mut() = position_account
                 .lamports()
-                .checked_add(position_lamports)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            **position_account.lamports.borrow_mut() = 0;
+                .saturating_sub(position_lamports);
+            **market_account.lamports.borrow_mut() = market_account
+                .lamports()
+                .saturating_add(position_lamports);
             
-            msg!("Negative PnL exceeds locked funds: all {} lamports transferred to vault", 
-                position_lamports);
+            msg!("Total loss: {} lamports", position_lamports);
         } else {
-            let remaining_funds = position_lamports.checked_sub(pnl_abs)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
+            let remaining_funds = position_lamports.saturating_sub(pnl_abs);
             
-            **program_vault_account.lamports.borrow_mut() = program_vault_account
+            **position_account.lamports.borrow_mut() = position_account
                 .lamports()
-                .checked_add(pnl_abs)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
+                .saturating_sub(pnl_abs);
+            **market_account.lamports.borrow_mut() = market_account
+                .lamports()
+                .saturating_add(pnl_abs);
             
+            **position_account.lamports.borrow_mut() = position_account
+                .lamports()
+                .saturating_sub(remaining_funds);
             **owner_account.lamports.borrow_mut() = owner_account
                 .lamports()
-                .checked_add(remaining_funds)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
+                .saturating_add(remaining_funds);
             
-            **position_account.lamports.borrow_mut() = 0;
-            
-            msg!("Negative PnL: {} lamports subtracted from locked funds", pnl_abs);
-            msg!("Remaining: {} lamports returned to owner", remaining_funds);
+            msg!("Loss: {}, remaining: {}", pnl_abs, remaining_funds);
         }
     } else {
+        **position_account.lamports.borrow_mut() = position_account
+            .lamports()
+            .saturating_sub(position_lamports);
         **owner_account.lamports.borrow_mut() = owner_account
             .lamports()
-            .checked_add(position_lamports)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        **position_account.lamports.borrow_mut() = 0;
+            .saturating_add(position_lamports);
         
-        msg!("Zero PnL: All locked funds ({} lamports) returned to owner", position_lamports);
+        msg!("Zero PnL: {} returned", position_lamports);
     }
     
-    {
-        let mut data = position_account.try_borrow_mut_data()?;
-        for byte in data.iter_mut() {
-            *byte = 0;
-        }
-    }
+    zero_account_data(position_account)?;
     
-    msg!("Position nonce: {} closed with PnL: {}", position.position_nonce, pnl_data.final_pnl);
-    msg!("Position had leverage: {}x", position.leverage);
-    msg!("Position direction was: {}", if position.direction == POSITION_LONG { "LONG" } else { "SHORT" });
-    msg!("Position account closed");
+    msg!("Position {} closed", position.position_nonce);
     
     Ok(())
 }
 
-pub fn create_program_vault_if_needed(
+fn process_force_close(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
 ) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     
-    let payer_account = next_account_info(accounts_iter)?;
-    let program_vault_account = next_account_info(accounts_iter)?;
-    let system_program = next_account_info(accounts_iter)?;
+    let position_account = next_account_info(accounts_iter)?;
+    let owner_account = next_account_info(accounts_iter)?;
+    let dex_account = next_account_info(accounts_iter)?;
     
-    if !payer_account.is_signer {
+    if !dex_account.is_signer || dex_account.key != &DEX_PUBKEY {
         return Err(ProgramError::MissingRequiredSignature);
     }
     
-    if program_vault_account.data_is_empty() {
-        let (vault_pda, vault_bump) = find_program_vault_address(program_id);
-        
-        if vault_pda != *program_vault_account.key {
-            msg!("Vault account address does not match the PDA");
-            return Err(ProgramError::InvalidArgument);
-        }
-        
-        let rent = Rent::get()?;
-        let minimum_balance = rent.minimum_balance(0);
-        
-        let vault_seeds = &[
-            b"uranus_program_vault" as &[u8],
-            &[vault_bump],
-        ];
-        
-        invoke_signed(
-            &system_instruction::create_account(
-                payer_account.key,
-                program_vault_account.key,
-                minimum_balance,
-                0,
-                program_id,
-            ),
-            &[
-                payer_account.clone(),
-                program_vault_account.clone(),
-                system_program.clone(),
-            ],
-            &[vault_seeds],
-        )?;
-        
-        msg!("Program vault created successfully");
+    if position_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
     }
+    
+    msg!("Force closing corrupted position");
+    
+    let position_lamports = position_account.lamports();
+    **owner_account.lamports.borrow_mut() = owner_account
+        .lamports()
+        .saturating_add(position_lamports);
+    **position_account.lamports.borrow_mut() = 0;
+    
+    zero_account_data(position_account)?;
+    
+    msg!("Force closed position, returned {} lamports", position_lamports);
+    
+    Ok(())
+}
+
+fn zero_account_data(account: &AccountInfo) -> ProgramResult {
+    let mut data = account.try_borrow_mut_data()?;
+
+    let len = data.len();
+    for i in 0..len {
+        data[i] = 0;
+    }
+    Ok(())
+}
+
+fn process_market_transfer(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    transfer_data: MarketTransferData,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let from_market_account = next_account_info(accounts_iter)?;
+    let to_market_account = next_account_info(accounts_iter)?;
+    let from_pda = next_account_info(accounts_iter)?;
+    let to_pda = next_account_info(accounts_iter)?;
+    let dex_account = next_account_info(accounts_iter)?;
+    
+    if !dex_account.is_signer || dex_account.key != &DEX_PUBKEY {
+        msg!("Unauthorized market transfer attempt");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    let (from_market_pda, from_bump) = find_market_address(
+        &transfer_data.from_market_mint,
+        program_id
+    );
+    
+    let (to_market_pda, to_bump) = find_market_address(
+        &transfer_data.to_market_mint,
+        program_id
+    );
+
+    if from_pda.key != &from_market_pda {
+        msg!("Invalid from_market PDA, expected {}, got {}", from_market_pda, from_pda.key);
+        return Err(ProgramError::InvalidArgument);
+    }
+    
+    if to_pda.key != &to_market_pda {
+        msg!("Invalid to_market PDA, expected {}, got {}", to_market_pda, to_pda.key);
+        return Err(ProgramError::InvalidArgument);
+    }
+    
+    if from_pda.owner != program_id {
+        msg!("From market PDA not owned by program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    
+    if to_pda.owner != program_id {
+        msg!("To market PDA not owned by program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    
+    let from_balance = from_pda.lamports();
+    if from_balance < transfer_data.amount {
+        msg!("Insufficient balance in from_market PDA. Has: {}, Requested: {}", 
+             from_balance, transfer_data.amount);
+        return Err(ProgramError::InsufficientFunds);
+    }
+    
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(from_pda.data_len());
+    if from_pda.lamports().saturating_sub(transfer_data.amount) < min_balance {
+        msg!("Transfer would make from_pda not rent exempt");
+        return Err(ProgramError::InsufficientFunds);
+    }
+    
+    if from_pda.key == to_pda.key {
+        msg!("Cannot transfer to the same market PDA");
+        return Err(ProgramError::InvalidArgument);
+    }
+    
+    **from_pda.lamports.borrow_mut() = from_pda
+        .lamports()
+        .saturating_sub(transfer_data.amount);
+    
+    **to_pda.lamports.borrow_mut() = to_pda
+        .lamports()
+        .saturating_add(transfer_data.amount);
+    
+    msg!("Market PDA transfer completed:");
+    msg!("  From market mint: {}", transfer_data.from_market_mint);
+    msg!("  To market mint: {}", transfer_data.to_market_mint);
+    msg!("  Amount: {} lamports", transfer_data.amount);
+    msg!("  From PDA balance after: {} lamports", from_pda.lamports());
+    msg!("  To PDA balance after: {} lamports", to_pda.lamports());
+    
+    Ok(())
+}
+
+fn process_drain_old_vault(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    
+    let vault_account = next_account_info(accounts_iter)?;
+    let dex_account = next_account_info(accounts_iter)?;
+    let system_program = next_account_info(accounts_iter)?;
+    
+    if !dex_account.is_signer || dex_account.key != &DEX_PUBKEY {
+        msg!("Unauthorized vault drain attempt");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    
+    let (vault_pda, vault_bump) = find_program_vault_address(program_id);
+    
+    if vault_account.key != &vault_pda {
+        msg!("Invalid vault account, expected {}, got {}", vault_pda, vault_account.key);
+        return Err(ProgramError::InvalidArgument);
+    }
+    
+    if vault_account.owner != &solana_program::system_program::id() {
+        msg!("Vault account not owned by system program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    
+    if system_program.key != &solana_program::system_program::id() {
+        msg!("Invalid system program");
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    
+    let vault_balance = vault_account.lamports();
+    
+    if vault_balance == 0 {
+        msg!("Vault is already empty");
+        return Ok(());
+    }
+    
+    let rent = Rent::get()?;
+    let min_balance = rent.minimum_balance(vault_account.data_len());
+    
+    let transferable_amount = vault_balance.saturating_sub(min_balance);
+    
+    if transferable_amount == 0 {
+        msg!("No transferable funds in vault (only rent-exempt minimum)");
+        return Ok(());
+    }
+    
+    let transfer_instruction = system_instruction::transfer(
+        vault_account.key,
+        dex_account.key,
+        transferable_amount,
+    );
+    
+    let vault_seeds = &[
+        b"uranus_program_vault" as &[u8],
+        &[vault_bump],
+    ];
+    
+    invoke_signed(
+        &transfer_instruction,
+        &[
+            vault_account.clone(),
+            dex_account.clone(),
+            system_program.clone(),
+        ],
+        &[vault_seeds],
+    )?;
+    
+    msg!("Vault drained successfully:");
+    msg!("  Transferred: {} lamports", transferable_amount);
+    msg!("  Remaining in vault: {} lamports (rent exemption)", min_balance);
+    msg!("  DEX balance after: {} lamports", dex_account.lamports());
     
     Ok(())
 }
