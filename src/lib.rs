@@ -22,7 +22,6 @@ pub const INSTRUCTION_USER_MODIFY: u8 = 2;
 pub const INSTRUCTION_PROCESS_PNL: u8 = 3;
 pub const INSTRUCTION_FORCE_CLOSE: u8 = 4;
 pub const INSTRUCTION_MARKET_TRANSFER: u8 = 5;
-pub const INSTRUCTION_DRAIN_OLD_VAULT: u8 = 6;
 
 pub const MIN_POSITION_SIZE_LAMPORTS: u64 = 10_000_000;
 pub const BASE_FEE_BASIS_POINTS: u64 = 200;
@@ -157,9 +156,6 @@ pub fn process_instruction(
             }
             let transfer_data = MarketTransferData::try_from_slice(&instruction_data[1..])?;
             process_market_transfer(program_id, accounts, transfer_data)
-        },
-        INSTRUCTION_DRAIN_OLD_VAULT => {
-            process_drain_old_vault(program_id, accounts)
         },
         _ => {
             msg!("Invalid instruction type: {}", instruction_type);
@@ -737,6 +733,18 @@ fn process_market_transfer(
         return Err(ProgramError::IncorrectProgramId);
     }
     
+    if !from_pda.data_is_empty() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    
+    if !to_pda.data_is_empty() {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    
+    if from_pda.lamports() == 0 {
+        return Err(ProgramError::InsufficientFunds);
+    }
+    
     let from_balance = from_pda.lamports();
     if from_balance < transfer_data.amount {
         msg!("Insufficient balance in from_market PDA. Has: {}, Requested: {}", 
@@ -770,84 +778,6 @@ fn process_market_transfer(
     msg!("  Amount: {} lamports", transfer_data.amount);
     msg!("  From PDA balance after: {} lamports", from_pda.lamports());
     msg!("  To PDA balance after: {} lamports", to_pda.lamports());
-    
-    Ok(())
-}
-
-fn process_drain_old_vault(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-) -> ProgramResult {
-    let accounts_iter = &mut accounts.iter();
-    
-    let vault_account = next_account_info(accounts_iter)?;
-    let dex_account = next_account_info(accounts_iter)?;
-    let system_program = next_account_info(accounts_iter)?;
-    
-    if !dex_account.is_signer || dex_account.key != &DEX_PUBKEY {
-        msg!("Unauthorized vault drain attempt");
-        return Err(ProgramError::MissingRequiredSignature);
-    }
-    
-    let (vault_pda, vault_bump) = find_program_vault_address(program_id);
-    
-    if vault_account.key != &vault_pda {
-        msg!("Invalid vault account, expected {}, got {}", vault_pda, vault_account.key);
-        return Err(ProgramError::InvalidArgument);
-    }
-    
-    if vault_account.owner != &solana_program::system_program::id() {
-        msg!("Vault account not owned by system program");
-        return Err(ProgramError::IncorrectProgramId);
-    }
-    
-    if system_program.key != &solana_program::system_program::id() {
-        msg!("Invalid system program");
-        return Err(ProgramError::IncorrectProgramId);
-    }
-    
-    let vault_balance = vault_account.lamports();
-    
-    if vault_balance == 0 {
-        msg!("Vault is already empty");
-        return Ok(());
-    }
-    
-    let rent = Rent::get()?;
-    let min_balance = rent.minimum_balance(vault_account.data_len());
-    
-    let transferable_amount = vault_balance.saturating_sub(min_balance);
-    
-    if transferable_amount == 0 {
-        msg!("No transferable funds in vault (only rent-exempt minimum)");
-        return Ok(());
-    }
-    
-    let transfer_instruction = system_instruction::transfer(
-        vault_account.key,
-        dex_account.key,
-        transferable_amount,
-    );
-    
-    let vault_seeds = &[
-        b"uranus_program_vault" as &[u8],
-        &[vault_bump],
-    ];
-    
-    invoke_signed(
-        &transfer_instruction,
-        &[
-            vault_account.clone(),
-            dex_account.clone(),
-            system_program.clone(),
-        ],
-        &[vault_seeds],
-    )?;
-    
-    msg!("Vault drained successfully:");
-    msg!("  Transferred: {} lamports", transferable_amount);
-    msg!("  Remaining in vault: {} lamports (rent exemption)", min_balance);
-    msg!("  DEX balance after: {} lamports", dex_account.lamports());
     
     Ok(())
 }
