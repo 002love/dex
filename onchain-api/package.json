@@ -1,0 +1,24 @@
+{
+  "name": "uranus-dex-onchain-api",
+  "version": "1.0.0",
+  "description": "uranus.ag onchain api that provides you with an ever growing set of tools to interact with Uranus DEX Programs on-chain in an easy way.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/URANUSDEX/dex.git"
+  },
+  "author": "sakidev",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/URANUSDEX/dex/issues"
+  },
+  "homepage": "https://github.com/URANUSDEX/dex#readme",
+  "dependencies": {
+    "@metaplex-foundation/mpl-token-metadata": "^3.4.0",
+    "@solana/web3.js": "^1.98.4",
+    "borsh": "^1.0.0"
+  }
+}
