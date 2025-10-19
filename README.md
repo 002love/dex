@@ -37,14 +37,15 @@ const DEX_FEES_PUBKEY = "URAfeAaGMoavvTe8vqPwMX6cUvTjq8WMG5c9nFo7Q8j";
 - Node.js 16+
 
 ```bash
-cd onchain-api
-npm install
+mkdir my-project
+cd my-project
+npm install uranus-dex-onchain-api
 ```
 
 #### Create a Position
 
 ```javascript
-const { createUranusPositionTransaction } = require('./onchain-api');
+const { createUranusPositionTransaction } = require('uranus-dex-onchain-api');
 
 const { transaction, positionNonce, positionPda, fees } = await createUranusPositionTransaction(
   connection,
