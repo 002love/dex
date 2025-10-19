@@ -88,14 +88,14 @@ async function getMarketLiquidity(connection, mint){
     return liquidity;
 }
 
-function calculateFees(solAmount, leverage) {
+async function calculateFees(solAmount, leverage, connection) {
   const lamports = solAmount * LAMPORTS_PER_SOL;
   const basePaidAmount = new BN(lamports);
   
   const baseFee = basePaidAmount.mul(new BN(200)).div(new BN(10000)); // 2%
   const leverageFee = basePaidAmount.mul(new BN(10)).mul(new BN(leverage)).div(new BN(10000)); // 0.1% per leverage
   const percentageFee = baseFee.add(leverageFee);
-  const accountFee = new BN(0.025506457970688 * LAMPORTS_PER_SOL);
+  const accountFee = await connection.getMinimumBalanceForRentExemption(PositionAccountData.size) / LAMPORTS_PER_SOL;
   
   return { basePaidAmount, percentageFee, accountFee };
 }
@@ -111,7 +111,7 @@ async function createUranusPositionTransaction(connection, owner, mint, solAmoun
   if (!marketMetadata.symbol)
     throw new Error("Market metadata symbol not found");
 
-  const { basePaidAmount, percentageFee, accountFee } = calculateFees(solAmount, leverage);
+  const { basePaidAmount, percentageFee, accountFee } = await calculateFees(solAmount, leverage, connection);
   const paidAmount = basePaidAmount.add(percentageFee).add(accountFee);
   const positionSize = basePaidAmount.sub(percentageFee).sub(accountFee).mul(new BN(leverage));
 

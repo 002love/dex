@@ -31,6 +31,8 @@ class PositionAccountData {
       direction: "i8",
     },
   };
+
+  static size = 32 + 32 + 32 + 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1;
 }
 
 class InitializePositionData {
