@@ -95,7 +95,9 @@ async function calculateFees(solAmount, leverage, connection) {
   const baseFee = basePaidAmount.mul(new BN(200)).div(new BN(10000)); // 2%
   const leverageFee = basePaidAmount.mul(new BN(10)).mul(new BN(leverage)).div(new BN(10000)); // 0.1% per leverage
   const percentageFee = baseFee.add(leverageFee);
-  const accountFee = await connection.getMinimumBalanceForRentExemption(PositionAccountData.size) / LAMPORTS_PER_SOL;
+  const accountFee = new BN(
+    await connection.getMinimumBalanceForRentExemption(PositionAccountData.size)
+  );
   
   return { basePaidAmount, percentageFee, accountFee };
 }
@@ -167,6 +169,7 @@ async function createUranusPositionTransaction(connection, owner, mint, solAmoun
     positionNonce: positionNonce.toNumber(),
     positionPda,
     fees: percentageFee.add(accountFee).toNumber() / LAMPORTS_PER_SOL,
+    totalCost: paidAmount.toNumber() / LAMPORTS_PER_SOL,
   };
 }
 
