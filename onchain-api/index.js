@@ -136,7 +136,7 @@ async function createUranusPositionTransaction(connection, owner, mint, solAmoun
       position_size: positionSize,
       leverage,
       position_nonce: positionNonce,
-      direction: direction.toLowerCase() === "long" ? 1 : 0,
+      direction: direction.toLowerCase() === "long" ? 1 : -1,
     })
   );
 
