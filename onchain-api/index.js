@@ -270,7 +270,10 @@ async function getAllMarkets(connection){
   const validAccounts = accounts.filter(({ account }) => account.data.byteLength === 0);
   
   const lamports = await Promise.all(
-    validAccounts.map(({ pubkey }) => connection.getAccountInfo(pubkey))
+    validAccounts.map(async ({ pubkey }) => {
+      const accountInfo = await connection.getAccountInfo(pubkey);
+      return accountInfo;
+    })
   );
   validAccounts.forEach((account, idx) => {
     account.lamports = lamports[idx] ? lamports[idx].lamports : 0;
@@ -282,8 +285,13 @@ async function getAllMarkets(connection){
   }));
 }
 
-async function getAllSignaturesForMarket(connection, marketMint, maxTimeSpan = 24){
-  const marketAccount = getMarketAccount(marketMint);
+async function getAllSignaturesForMarket(connection, marketMint, maxTimeSpan = 24, marketMintIsPDA = false){
+  let marketAccount;
+
+  if(!marketMintIsPDA)
+    marketAccount = getMarketAccount(marketMint);
+  else
+    marketAccount = marketMint;
 
   let allSignatures = [];
   let before = null;
@@ -344,8 +352,8 @@ async function getParsedTransactionsForMarket(connection, signatures){
   return relevantTransactions;
 }
 
-async function getMarketVolume(connection, marketMint, maxTimeSpan = 24){
-  const signatures = await getAllSignaturesForMarket(connection, marketMint, maxTimeSpan);
+async function getMarketVolume(connection, marketMint, maxTimeSpan = 24, marketMintIsPDA = false){
+  const signatures = await getAllSignaturesForMarket(connection, marketMint, maxTimeSpan, marketMintIsPDA);
   const txns = await getParsedTransactionsForMarket(connection, signatures);
   const volume = countVolumeFromTransactions(txns);
   return volume;
