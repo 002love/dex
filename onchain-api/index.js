@@ -411,6 +411,7 @@ async function getTickerPrice(ticker){
 module.exports = {
     getMarketAccount,
     getMarketLiquidity,
+    calculateFees,
     createUranusPositionTransaction,
     closeUranusPosition,
     getOpenPositions,
